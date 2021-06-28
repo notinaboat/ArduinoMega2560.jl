@@ -45,7 +45,7 @@ static bool fifo_is_not_empty(const fifo_t* const p)
     return !fifo_is_empty(p);
 }
 
-static bool fifo_is_not_full(const fifo_t* const p)
+bool fifo_is_not_full(const fifo_t* const p)
 {
     return !fifo_is_full(p);
 }
