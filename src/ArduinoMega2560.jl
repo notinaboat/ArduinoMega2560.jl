@@ -26,15 +26,16 @@ end
 function socat(from, to; debug=false)
     stderr_pipe=Pipe()
     cmd = debug ? `socat -v` : `socat`
-    run(pipeline(`$cmd $from $to`;
-                 stdin=devnull,
-                 stdout=devnull,
-                 stderr=stderr_pipe), wait = false)
+    p = run(pipeline(`$cmd $from $to`;
+                     stdin=devnull,
+                     stdout=devnull,
+                     stderr=stderr_pipe); wait = false)
     close(stderr_pipe.in)
     @async try
         while isopen(stderr_pipe.out)
             @warn "socat: $(readline(stderr_pipe))"
         end
+        wait(p)
     catch err
         exception=(err, catch_backtrace())
         @error "Error reading from `socat`" exception
@@ -88,6 +89,9 @@ struct MegaGPIO
     end
 end
 
+Base.close(m::MegaGPIO) = close(m.tx)
+Base.isopen(m::MegaGPIO) = isopen(m.tx)
+
 isfull(c::Channel) = length(c.data) ≥ c.sz_max
 
 function readline_channels(io)
@@ -119,6 +123,7 @@ function readline_channels(io)
             end
             yield()
         end
+        @warn "Mega.GPIO.readline_channels() exiting..."
     catch err
         exception=(err, catch_backtrace())
         @error "Error reading from $io" exception
@@ -140,7 +145,7 @@ end
 
 function recv(io)
     r = readline(io)
-    if isempty(r)
+    if isempty(r) && isopen(io)
         r = readline(io)
     end
     #@info "MegaGPIO ==> \"$r\""
