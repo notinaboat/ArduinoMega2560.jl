@@ -6,7 +6,7 @@ module ArduinoMega2560
 using Once
 using PiAVR
 using PiAVRDude
-using Sockets
+using UnixIO
 
 
 
@@ -23,150 +23,136 @@ function flash(port)
 end
 
 
-function socat(from, to; debug=false)
-    stderr_pipe=Pipe()
-    cmd = debug ? `socat -v` : `socat`
-    p = run(pipeline(`$cmd $from $to`;
-                     stdin=devnull,
-                     stdout=devnull,
-                     stderr=stderr_pipe); wait = false)
-    close(stderr_pipe.in)
-    @async try
-        while isopen(stderr_pipe.out)
-            @warn "socat: $(readline(stderr_pipe))"
-        end
-        wait(p)
-    catch err
-        exception=(err, catch_backtrace())
-        @error "Error reading from `socat`" exception
-    end
-end
-
 
 # GPIO Interface.
 
 struct MegaGPIO
 
     port::String
-    rx::Channel{String}
-    tx::IO
+    io::IO
+    response::Channel{String}
     monitor::Channel{String}
     usarts::Vector{Channel{String}}
 
     function MegaGPIO(port)
 
+   if false
         socket = "$(tempname()).mega_gpio_socket"
-        socat("$port,b38400,rawer", "UNIX-LISTEN:$socket"; debug=false)
+        @async UnixIO.system(`socat $port,b38400,rawer UNIX-LISTEN:$socket \< /dev/null`)
+
         while !ispath(socket)
-            @warn "Waiting for $socket"
             sleep(1)
+            if !ispath(socket)
+                @warn "Waiting for $socket"
+            end
         end
-        io = Sockets.connect(socket)
+
+            sleep(1)
+        io = UnixIO.open(socket, UnixIO.O_RDWR; yield=false)
+
+        sleep(1)
+    else
+        io = nothing
+        @sync begin
+            @async io = UnixIO.open(port,
+                                    UnixIO.O_RDWR |
+                                    UnixIO.O_NOCTTY |
+                                    0x101000; # FIXME needed ? harmfull?
+                                    yield=true)
+            sleep(2)
+            if io == nothing
+                @error "Stuck trying to open $port"
+            end
+        end
+
+        UnixIO.tcsetattr(io; lflag=UnixIO.ICANON, speed=38400)
 
         # Wait for DTR auto-reset.
         sleep(1)
+        UnixIO.tcflush(io, UnicIO.TCIOFLUSH)
 
-        # Reset and drain input.
-        send(io, "Z")
-        x = recv(io)
-        while x != ">Z" || bytesavailable(io) > 0
-            x = recv(io)
-        end
+        response = Channel{String}(1000)
+        monitor = Channel{String}(1000)
+        usarts = [Channel{String}(1000) for i in 1:3]
 
-        # Reset again.
-        send(io, "Z")
-        r = recv(io)
-        @assert r == ">Z"
-
-        # Open rx channel.
-        rx, monitor, usarts = readline_channels(io)
-
-        m = new(port, rx, io, monitor, usarts)
-
+        m = new(port, io, response, monitor, usarts)
         @info "Opened MegaGPIO on $port"
-
+        reset(m)
         m
     end
 end
 
-Base.close(m::MegaGPIO) = close(m.tx)
-Base.isopen(m::MegaGPIO) = isopen(m.tx)
+Base.close(m::MegaGPIO) = close(m.io)
+Base.isopen(m::MegaGPIO) = isopen(m.io)
 
 isfull(c::Channel) = length(c.data) ≥ c.sz_max
-
-function readline_channels(io)
-    rx_channel = Channel{String}(0)
-    monitor_channel = Channel{String}(1000)
-    usarts = [Channel{String}(1000) for i in 1:3]
-    @async try
-        while isopen(io)
-            line = recv(io)
-            if startswith(line, "1")
-                @assert !isfull(usarts[1])
-                put!(usarts[1], line[2:end])
-            elseif startswith(line, "2")
-                @assert !isfull(usarts[2])
-                put!(usarts[2], line[2:end])
-            elseif startswith(line, "3")
-                @assert !isfull(usarts[3])
-                put!(usarts[3], line[2:end])
-            elseif startswith(line, "!")
-                if length(line) != 4
-                    @error "Bad monitor line $line"
-                else
-                    put!(monitor_channel, line[2:end])
-                end
-            elseif startswith(line, ">") 
-                put!(rx_channel, line)
-            else
-                @error "Bad monitor line: \"$line\""
-            end
-            yield()
-        end
-        @warn "Mega.GPIO.readline_channels() exiting..."
-    catch err
-        exception=(err, catch_backtrace())
-        @error "Error reading from $io" exception
-    end
-
-    return rx_channel, monitor_channel, usarts
-end
-
 
 status(m::MegaGPIO) = PiAVRDude.status(m.avr.isp)
 
 
-function send(io, data)
-    write(io, "$data\r\n")
-    flush(io)
-    #@info "\"$data\\r\\n\" => MegaGPIO"
+function send_command(m, data)
+    @info "\"$data\\r\\n\" => MegaGPIO"
+    write(m.io, "$data\r\n")
+    UnixIO.tcdrain(m.io) # FIXME needed?
     nothing
 end
 
-function recv(io)
-    r = readline(io)
-    if isempty(r) && isopen(io)
-        r = readline(io)
+function recv_response(m)
+
+    line = readline(m.io)
+    while isempty(line) && isopen(m.io)
+        line = readline(m.io)
     end
-    #@info "MegaGPIO ==> \"$r\""
-    r
+    if !isopen(m.io)
+        throw(EOFError())
+    end
+
+    @assert !isempty(line)
+
+    c = line[1]
+    channel = if c == '>' m.response
+          elseif c == '!' m.monitor
+          elseif c == '1' m.usarts[1]
+          elseif c == '2' m.usarts[2]
+          elseif c == '3' m.usarts[3]
+            else
+                @error "MegaGPIO ==> \"$line\""
+                return
+            end
+
+    @info "MegaGPIO ==> \"$line\""
+    @assert !isfull(channel)
+    put!(channel, line[2:end])
+
+    nothing
 end
+
+
+empty_channel!(c::Channel) = while !isempty(c) take!(c) end
+
 
 function reset(m)
-    send(m.tx, "Z")
-    result = take!(m.rx)
-    @assert result == ">Z"
-    while !isempty(m.monitor)
-        take!(m.monitor)
+    empty_channel!(m.response)
+    send_command(m, "Z")
+    while isempty(m.response)
+        recv_response(m)
     end
-    nothing
+    result = take!(m.response)
+    @assert result == "Z"
+    empty_channel!(m.monitor)
+    for u in m.usarts
+        empty_channel!(u)
+    end
 end
 
 function command(m::MegaGPIO, command)
-    send(m.tx, command)
-    result = take!(m.rx)
-    @assert startswith(result, ">$command")
-    value = result[length(command)+2:end]
+    send_command(m, command)
+    while isempty(m.response)
+        recv_response(m)
+    end
+    result = take!(m.response)
+    @assert startswith(result, "$command")
+    value = result[length(command)+1:end]
     return isempty(value) ? nothing : parse(Int, value; base = 16)
 end
 
@@ -204,15 +190,22 @@ Base.getindex(m::MegaADC, pin) = command(m.gpio, "A$pin")
 
 struct MegaUSART
     gpio::MegaGPIO
-    usart::UInt8
+    id::UInt8
 end
 
-rx_channel(m::MegaUSART) = m.gpio.usarts[m.usart]
+rx_channel(m::MegaUSART) = m.gpio.usarts[m.id]
 
 Base.isempty(m::MegaUSART) = isempty(rx_channel(m))
-Base.take!(m::MegaUSART) = take!(rx_channel(m))
-Base.empty!(m::MegaUSART) = while !isempty(m) take!(m) end
-Base.write(m::MegaUSART, x) = (command(m.gpio, "$(m.usart)$x") ; nothing)
+Base.empty!(m::MegaUSART) = empty_channel!(rx_channel(m))
+Base.write(m::MegaUSART, x) = (command(m.gpio, "$(m.id)$x") ; nothing)
+
+function Base.take!(m::MegaUSART) 
+    c = rx_channel(m)
+    while isempty(c)
+        recv_response(m.gpio)
+    end
+    take!(c)
+end
 
 
 end # module
