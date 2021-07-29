@@ -16,7 +16,7 @@ README.pdf: README.md
 	          -V 'monofont:FiraCode-Regular.ttf' \
 	          -o $@
 
-JL := julia16 -C $(CPU_TARGET) --project
+JL := julia -C $(CPU_TARGET) --project
 #JL := julia --project
 
 jl:

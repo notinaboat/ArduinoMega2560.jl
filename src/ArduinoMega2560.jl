@@ -7,19 +7,21 @@ using Once
 using PiAVR
 using PiAVRDude
 using UnixIO
+using UnixIO.Debug
+using UnixIO: C
 
 
 
 # Firmware Programming.
 
-function flash(port)
+@db function flash(port)
 
-        avr = AVRDevice(device = "atmega2560",
-                      usb_port = port,
-                        c_file = joinpath(@__DIR__, "main.c"),
-                         fuses = [])
+    avr = AVRDevice(device = "atmega2560",
+                  usb_port = port,
+                    c_file = joinpath(@__DIR__, "main.c"),
+                     fuses = [])
 
-        PiAVR.flash(avr)
+    PiAVR.flash(avr)
 end
 
 
@@ -34,51 +36,35 @@ struct MegaGPIO
     monitor::Channel{String}
     usarts::Vector{Channel{String}}
 
-    function MegaGPIO(port)
+    @db function MegaGPIO(port)
 
-   if false
-        socket = "$(tempname()).mega_gpio_socket"
-        @async UnixIO.system(`socat $port,b38400,rawer UNIX-LISTEN:$socket \< /dev/null`)
-
-        while !ispath(socket)
-            sleep(1)
-            if !ispath(socket)
-                @warn "Waiting for $socket"
-            end
-        end
-
-            sleep(1)
-        io = UnixIO.open(socket, UnixIO.O_RDWR; yield=false)
-
-        sleep(1)
-    else
         io = nothing
         @sync begin
-            @async io = UnixIO.open(port,
-                                    UnixIO.O_RDWR |
-                                    UnixIO.O_NOCTTY |
-                                    0x101000; # FIXME needed ? harmfull?
-                                    yield=true)
+            @async io = UnixIO.open(port, C.O_RDWR | C.O_NOCTTY;
+                                    tcattr = a->(UnixIO.setraw(a);
+                                                 a.c_lflag |= C.ICANON;
+                                                 a.speed=38400))
             sleep(2)
             if io == nothing
-                @error "Stuck trying to open $port"
+                @db "Stuck trying to open $port"
             end
         end
 
-        UnixIO.tcsetattr(io; lflag=UnixIO.ICANON, speed=38400)
+        @show typeof(io.in)
+        @assert io.in isa UnixFD{UnixIO.CanonicalMode}
 
         # Wait for DTR auto-reset.
         sleep(1)
-        UnixIO.tcflush(io, UnicIO.TCIOFLUSH)
+        UnixIO.tcflush(io, C.TCIOFLUSH)
 
         response = Channel{String}(1000)
         monitor = Channel{String}(1000)
         usarts = [Channel{String}(1000) for i in 1:3]
 
         m = new(port, io, response, monitor, usarts)
-        @info "Opened MegaGPIO on $port"
+        @db "Opened MegaGPIO on $port"
         reset(m)
-        m
+        @db return m
     end
 end
 
@@ -90,14 +76,14 @@ isfull(c::Channel) = length(c.data) ≥ c.sz_max
 status(m::MegaGPIO) = PiAVRDude.status(m.avr.isp)
 
 
-function send_command(m, data)
-    @info "\"$data\\r\\n\" => MegaGPIO"
+@db function send_command(m, data)
+    @db "\"$data\\r\\n\" => MegaGPIO"
     write(m.io, "$data\r\n")
     UnixIO.tcdrain(m.io) # FIXME needed?
     nothing
 end
 
-function recv_response(m)
+@db function recv_response(m)
 
     line = readline(m.io)
     while isempty(line) && isopen(m.io)
@@ -116,11 +102,11 @@ function recv_response(m)
           elseif c == '2' m.usarts[2]
           elseif c == '3' m.usarts[3]
             else
-                @error "MegaGPIO ==> \"$line\""
+                @db "MegaGPIO ==> \"$line\""
                 return
             end
 
-    @info "MegaGPIO ==> \"$line\""
+    @db "MegaGPIO ==> \"$line\""
     @assert !isfull(channel)
     put!(channel, line[2:end])
 
@@ -128,10 +114,15 @@ function recv_response(m)
 end
 
 
-empty_channel!(c::Channel) = while !isempty(c) take!(c) end
+@db function empty_channel!(c::Channel)
+    while !isempty(c)
+        take!(c)
+    end
+    nothing
+end
 
 
-function reset(m)
+@db function reset(m)
     empty_channel!(m.response)
     send_command(m, "Z")
     while isempty(m.response)
@@ -145,15 +136,15 @@ function reset(m)
     end
 end
 
-function command(m::MegaGPIO, command)
+@db function command(m::MegaGPIO, command)
     send_command(m, command)
     while isempty(m.response)
         recv_response(m)
     end
-    result = take!(m.response)
+    result = take!(m.response)                                    ;@db 3 result
     @assert startswith(result, "$command")
     value = result[length(command)+1:end]
-    return isempty(value) ? nothing : parse(Int, value; base = 16)
+    @db return isempty(value) ? nothing : parse(Int, value; base = 16)
 end
 
 
@@ -166,9 +157,10 @@ read_input(m, pin) = !iszero(command(m, "I$pin"))
 enable_monitor(m, pin) = (command(m, "M$pin"); nothing)
 disable_monitor(m, pin) = (command(m, "N$pin"); nothing)
 
-function enable_input(m::MegaGPIO, pin; pullup=false)
+@db function enable_input(m::MegaGPIO, pin; pullup=false)
     pullup ? enable_input_with_pullup(m, pin) :
              enable_input_without_pullup(m, pin)
+    nothing
 end
 
 Base.setindex!(m::MegaGPIO, v::Bool, pin) = v ? output_high(m, pin) :
@@ -199,12 +191,12 @@ Base.isempty(m::MegaUSART) = isempty(rx_channel(m))
 Base.empty!(m::MegaUSART) = empty_channel!(rx_channel(m))
 Base.write(m::MegaUSART, x) = (command(m.gpio, "$(m.id)$x") ; nothing)
 
-function Base.take!(m::MegaUSART) 
+@db function Base.take!(m::MegaUSART) 
     c = rx_channel(m)
     while isempty(c)
         recv_response(m.gpio)
     end
-    take!(c)
+    @db return take!(c)
 end
 
 
