@@ -51,7 +51,7 @@ struct MegaGPIO
         end
 
         @show typeof(io.in)
-        @assert io.in isa UnixFD{UnixIO.CanonicalMode}
+        @assert io.in isa UnixIO.FD{UnixIO.In,UnixIO.CanonicalMode}
 
         # Wait for DTR auto-reset.
         sleep(1)
