@@ -1,5 +1,8 @@
 """
 Julia interface for Aurduino Mega 2560.
+
+
+FIXME Make the comms modbus compatible?
 """
 module ArduinoMega2560
 
