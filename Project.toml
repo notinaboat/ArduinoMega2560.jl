@@ -1,7 +1,7 @@
 name = "ArduinoMega2560"
 uuid = "70328d8b-6b27-49c8-a574-47c8b4a60300"
 authors = ["notinaboat <notinaboat@icloud.com>"]
-version = "0.2.0"
+version = "0.3.0"
 
 [deps]
 Once = "0cb64207-f9ca-4d2e-ae41-d4cccdc3cd56"
